@@ -2,6 +2,108 @@
 
 use crate::fmt::{self, Debug, Formatter};
 
+use super::Write;
+
+const MAX_WRAP_SIZE: usize = 40;
+
+struct AutoWrapper<'buf, 'state> {
+    buf: &'buf mut (dyn fmt::Write + 'buf),
+    state: &'state mut AutoWrapperState,
+}
+
+struct AutoWrapperState {
+    wrapped: bool,
+    queue: [u8; MAX_WRAP_SIZE],
+    queue_next: usize,
+    lines: [u8; MAX_WRAP_SIZE],
+    lines_next: usize,
+}
+
+impl Default for AutoWrapperState {
+    fn default() -> Self {
+        Self {
+            wrapped: Default::default(),
+            queue: [0; MAX_WRAP_SIZE],
+            queue_next: Default::default(),
+            lines: [0; MAX_WRAP_SIZE],
+            lines_next: Default::default(),
+        }
+    }
+}
+
+impl<'buf, 'state> AutoWrapper<'buf, 'state> {
+    fn wrap<'slot, 'fmt: 'buf + 'slot>(
+        fmt: &'fmt mut fmt::Formatter<'_>,
+        slot: &'slot mut Option<Self>,
+        state: &'state mut AutoWrapperState,
+    ) -> fmt::Formatter<'slot> {
+        fmt.wrap_buf(move |buf| slot.insert(AutoWrapper { buf, state }))
+    }
+}
+
+impl AutoWrapper<'_, '_> {
+    fn force_wrap(&mut self) -> fmt::Result {
+        self.state.wrapped = true;
+        let mut start = 0;
+        self.buf.write_char('\n')?;
+        for &end in &self.state.lines[0..self.state.lines_next] {
+            let end = end as usize;
+            self.buf.write_str(unsafe {
+                crate::str::from_utf8_unchecked(&self.state.queue[start..end - 1])
+            })?;
+            self.buf.write_char('\n')?;
+            start = end;
+        }
+        self.buf.write_str(unsafe {
+            crate::str::from_utf8_unchecked(&self.state.queue[start..self.state.queue_next])
+        })?;
+        Ok(())
+    }
+
+    fn end_line(&mut self) -> fmt::Result {
+        self.write_char(',')?;
+        if !self.state.wrapped && self.state.queue_next == self.state.queue.len() {
+            self.force_wrap()?;
+        }
+        if self.state.wrapped {
+            self.buf.write_str("\n")?;
+        } else {
+            self.write_char(' ')?;
+            self.state.lines[self.state.lines_next] = self.state.queue_next as u8;
+            self.state.lines_next += 1;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> fmt::Result {
+        if !self.state.wrapped {
+            self.buf.write_str(unsafe {
+                crate::str::from_utf8_unchecked(&self.state.queue[0..self.state.queue_next - 2])
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Write for AutoWrapper<'_, '_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if !self.state.wrapped
+            && (s.len() > self.state.queue.len() - self.state.queue_next || s.contains('\n'))
+        {
+            self.force_wrap()?;
+        }
+
+        if self.state.wrapped {
+            self.buf.write_str(s)?;
+        } else {
+            self.state.queue[self.state.queue_next..][..s.len()].copy_from_slice(s.as_bytes());
+            self.state.queue_next += s.len();
+        }
+
+        Ok(())
+    }
+}
+
 struct PadAdapter<'buf, 'state> {
     buf: &'buf mut (dyn fmt::Write + 'buf),
     state: &'state mut PadAdapterState,
@@ -31,7 +133,7 @@ impl fmt::Write for PadAdapter<'_, '_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for s in s.split_inclusive('\n') {
             if self.state.on_newline {
-                self.buf.write_str("    ")?;
+                self.buf.write_str("  ")?;
             }
 
             self.state.on_newline = s.ends_with('\n');
@@ -43,7 +145,7 @@ impl fmt::Write for PadAdapter<'_, '_> {
 
     fn write_char(&mut self, c: char) -> fmt::Result {
         if self.state.on_newline {
-            self.buf.write_str("    ")?;
+            self.buf.write_str("  ")?;
         }
         self.state.on_newline = c == '\n';
         self.buf.write_char(c)
@@ -288,6 +390,7 @@ impl<'a, 'b: 'a> DebugStruct<'a, 'b> {
 #[stable(feature = "debug_builders", since = "1.2.0")]
 pub struct DebugTuple<'a, 'b: 'a> {
     fmt: &'a mut fmt::Formatter<'b>,
+    auto: AutoWrapperState,
     result: fmt::Result,
     fields: usize,
     empty_name: bool,
@@ -298,7 +401,13 @@ pub(super) fn debug_tuple_new<'a, 'b>(
     name: &str,
 ) -> DebugTuple<'a, 'b> {
     let result = fmt.write_str(name);
-    DebugTuple { fmt, result, fields: 0, empty_name: name.is_empty() }
+    DebugTuple {
+        fmt,
+        auto: AutoWrapperState::default(),
+        result,
+        fields: 0,
+        empty_name: name.is_empty(),
+    }
 }
 
 impl<'a, 'b: 'a> DebugTuple<'a, 'b> {
@@ -342,13 +451,15 @@ impl<'a, 'b: 'a> DebugTuple<'a, 'b> {
         self.result = self.result.and_then(|_| {
             if self.is_pretty() {
                 if self.fields == 0 {
-                    self.fmt.write_str("(\n")?;
+                    self.fmt.write_str("(")?;
                 }
                 let mut slot = None;
-                let mut state = Default::default();
+                let mut state = PadAdapterState { on_newline: self.auto.wrapped };
                 let mut writer = PadAdapter::wrap(self.fmt, &mut slot, &mut state);
-                value_fmt(&mut writer)?;
-                writer.write_str(",\n")
+                let mut slot = None;
+                let mut auto = AutoWrapper::wrap(&mut writer, &mut slot, &mut self.auto);
+                value_fmt(&mut auto)?;
+                AutoWrapper { buf: &mut writer, state: &mut self.auto }.end_line()
             } else {
                 let prefix = if self.fields == 0 { "(" } else { ", " };
                 self.fmt.write_str(prefix)?;
@@ -390,6 +501,9 @@ impl<'a, 'b: 'a> DebugTuple<'a, 'b> {
             self.result = self.result.and_then(|_| {
                 if self.fields == 1 && self.empty_name && !self.is_pretty() {
                     self.fmt.write_str(",")?;
+                }
+                if self.is_pretty() {
+                    AutoWrapper { buf: self.fmt.buf, state: &mut self.auto }.finish()?;
                 }
                 self.fmt.write_str(")")
             });
